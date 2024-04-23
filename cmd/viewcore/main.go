@@ -25,6 +25,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/chzyer/readline"
+	"github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"golang.org/x/debug/internal/core"
@@ -138,6 +139,13 @@ var (
 		Args:  cobra.RangeArgs(1, 2),
 		Run:   runRead,
 	}
+
+	cmdPeek = &cobra.Command{
+		Use:   "peek <type>",
+		Short: "show objects that point to and are pointed from this type of object",
+		Args:  cobra.ExactArgs(1),
+		Run:   runPeek,
+	}
 )
 
 type config struct {
@@ -174,7 +182,9 @@ func init() {
 		cmdObjgraph,
 		cmdReachable,
 		cmdHTML,
-		cmdRead)
+		cmdRead,
+		cmdPeek,
+	)
 
 	// customize the usage template - viewcore's command structure
 	// is not typical of cobra-based command line tool.
@@ -461,6 +471,74 @@ func runGoroutines(cmd *cobra.Command, args []string) {
 	}
 }
 
+type typeHistogram struct {
+	buckets []*bucket
+	m       map[string]*bucket
+	c       *gocore.Process
+}
+
+func (h *typeHistogram) add(x gocore.Object, size int64) {
+	name := typeName(h.c, x)
+	b := h.m[name]
+	if b == nil {
+		b = &bucket{name: name, size: size}
+		h.buckets = append(h.buckets, b)
+		h.m[name] = b
+	}
+	if len(b.exemplars) < 3 {
+		b.exemplars = append(b.exemplars, exemplar{addr: core.Address(x), size: size})
+	}
+	b.count++
+}
+func (h *typeHistogram) sort() {
+	sort.Slice(h.buckets, func(i, j int) bool {
+		return h.buckets[i].size*h.buckets[i].count > h.buckets[j].size*h.buckets[j].count
+	})
+}
+func (h *typeHistogram) report(topN int, w io.Writer) {
+	// report only top N if requested
+	var totalSize int64
+	for i := range h.buckets {
+		totalSize += h.buckets[i].size * h.buckets[i].count
+	}
+	if topN > 0 && len(h.buckets) > topN {
+		h.buckets = h.buckets[:topN]
+	}
+
+	t := tabwriter.NewWriter(w, 0, 0, 1, ' ', tabwriter.AlignRight)
+	fmt.Fprintf(t, "%s\t%s\t%s\t%s\t%s\t %s\t %s\n", "count", "size", "bytes", "live%", "sum%", "type", "exemplars[addr:size]")
+	var totalPct float64
+	for _, e := range h.buckets {
+		size := e.count * e.size
+		pct := float64(size) / float64(totalSize) * 100
+		totalPct += pct
+		var exemplars strings.Builder
+		exemplars.WriteRune('[')
+		for _, exemplar := range e.exemplars {
+			exemplars.WriteString(fmt.Sprintf("%v:%v,", exemplar.addr, exemplar.size))
+		}
+		fmt.Fprintf(t, "%d\t%s\t%s\t%.2f\t%.2f\t %s\t %s\n", e.count,
+			humanize.Bytes(uint64(e.size)),
+			humanize.Bytes(uint64(size)),
+			pct,
+			totalPct,
+			e.name, exemplars.String())
+	}
+	fmt.Fprintf(t, "Total: %s\n", humanize.Bytes(uint64(totalSize)))
+	t.Flush()
+}
+
+type bucket struct {
+	name      string
+	size      int64
+	count     int64
+	exemplars []exemplar
+}
+type exemplar struct {
+	addr core.Address
+	size int64
+}
+
 func runHistogram(cmd *cobra.Command, args []string) {
 	topN, err := cmd.Flags().GetInt("top")
 	if err != nil {
@@ -470,54 +548,21 @@ func runHistogram(cmd *cobra.Command, args []string) {
 	if err != nil {
 		exitf("%v\n", err)
 	}
-	type exemplar struct {
-		addr core.Address
-		size int64
-	}
+
 	// Produce an object histogram (bytes per type).
-	type bucket struct {
-		name      string
-		size      int64
-		count     int64
-		exemplars []exemplar
+	h := typeHistogram{
+		c: c,
+		m: make(map[string]*bucket),
 	}
-	var buckets []*bucket
-	m := map[string]*bucket{}
+
 	c.ForEachObject(func(x gocore.Object) bool {
-		name := typeNameDebug(c, x)
-		b := m[name]
-		if b == nil {
-			b = &bucket{name: name, size: c.Size(x)}
-			buckets = append(buckets, b)
-			m[name] = b
-		}
-		if len(b.exemplars) < 3 {
-			b.exemplars = append(b.exemplars, exemplar{addr: core.Address(x), size: c.Size(x)})
-		}
-		b.count++
+		var size int64
+		size = c.Size(x)
+		h.add(x, size)
 		return true
 	})
-	sort.Slice(buckets, func(i, j int) bool {
-		return buckets[i].count*buckets[i].size > buckets[j].count*buckets[j].size
-	})
-
-	// report only top N if requested
-	if topN > 0 && len(buckets) > topN {
-		buckets = buckets[:topN]
-	}
-
-	t := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', tabwriter.AlignRight)
-	fmt.Fprintf(t, "%s\t%s\t%s\t %s\t %s\n", "count", "size", "bytes", "type", "exemplars[addr:size]")
-	for _, e := range buckets {
-		var exemplars strings.Builder
-		exemplars.WriteRune('[')
-		for _, exemplar := range e.exemplars {
-			exemplars.WriteString(fmt.Sprintf("%v:%v,", exemplar.addr, exemplar.size))
-		}
-		exemplars.WriteRune(']')
-		fmt.Fprintf(t, "%d\t%d\t%d\t %s\t %s\n", e.count, e.size, e.count*e.size, e.name, exemplars.String())
-	}
-	t.Flush()
+	h.sort()
+	h.report(topN, os.Stdout)
 }
 
 func runBreakdown(cmd *cobra.Command, args []string) {
@@ -776,26 +821,73 @@ func runRead(cmd *cobra.Command, args []string) {
 	fmt.Println()
 }
 
+func runPeek(cmd *cobra.Command, args []string) {
+	_, c, err := readCore()
+	if err != nil {
+		exitf("%v\n", err)
+	}
+	typName := args[0]
+
+	inH := typeHistogram{
+		c: c,
+		m: make(map[string]*bucket),
+	}
+	h := typeHistogram{
+		c: c,
+		m: make(map[string]*bucket),
+	}
+	outH := typeHistogram{
+		c: c,
+		m: make(map[string]*bucket),
+	}
+	c.ForEachObject(func(x gocore.Object) bool {
+		typ := typeName(c, x)
+		if typ == typName {
+			size := c.Size(x)
+			h.add(x, size)
+			c.ForEachReversePtr(x, func(y gocore.Object, r *gocore.Root, i, j int64) bool {
+				if r == nil {
+					inH.add(y, size)
+				}
+				return true
+			})
+			c.ForEachPtr(x, func(i int64, y gocore.Object, j int64) bool {
+				outH.add(y, c.Size(y))
+				return true
+			})
+		}
+		return true
+	})
+	inH.sort()
+	inH.report(0, os.Stdout)
+	h.sort()
+	h.report(0, os.Stdout)
+	outH.sort()
+	outH.report(0, os.Stdout)
+
+}
+
 // typeName returns a string representing the type of this object.
 func typeName(c *gocore.Process, x gocore.Object) string {
-	size := c.Size(x)
-	typ, repeat := c.Type(x)
-	if typ == nil {
-		return fmt.Sprintf("unk%d-[%d]", size, repeat)
-	}
-	name := typ.String()
-	if typ.Size == 0 {
-		return name
-	}
-	n := size / typ.Size
-	if n > 1 {
-		if repeat < n {
-			name = fmt.Sprintf("[%d+%d?]%s", repeat, n-repeat, name)
-		} else {
-			name = fmt.Sprintf("[%d]%s", repeat, name)
-		}
-	}
-	return name
+	return gocore.TypeName(c, x)
+	// size := c.Size(x)
+	// typ, repeat := c.Type(x)
+	// if typ == nil {
+	// 	return fmt.Sprintf("unk%d-[%d]", size, repeat)
+	// }
+	// name := typ.String()
+	// if typ.Size == 0 {
+	// 	return name
+	// }
+	// n := size / typ.Size
+	// if n > 1 {
+	// 	if repeat < n {
+	// 		name = fmt.Sprintf("[%d+%d?]%s", repeat, n-repeat, name)
+	// 	} else {
+	// 		name = fmt.Sprintf("[%d]%s", repeat, name)
+	// 	}
+	// }
+	// return name
 }
 
 // typeName returns a string representing the type of this object.

@@ -92,6 +92,28 @@ func (t *Type) HasField(name string) bool {
 	return t.field(name) != nil
 }
 
+// TypeName returns a string representing the type of this object.
+func TypeName(c *Process, x Object) string {
+	size := c.Size(x)
+	typ, repeat := c.Type(x)
+	if typ == nil {
+		return fmt.Sprintf("unk%d", size)
+	}
+	name := typ.String()
+	var n int64
+	if typ.Size != 0 {
+		n = size / typ.Size
+	}
+	if n > 1 {
+		if repeat < n {
+			name = fmt.Sprintf("[%d+%d?]%s", repeat, n-repeat, name)
+		} else {
+			name = fmt.Sprintf("[%d]%s", repeat, name)
+		}
+	}
+	return name
+}
+
 // DynamicType returns the concrete type stored in the interface type t at address a.
 // If the interface is nil, returns nil.
 func (p *Process) DynamicType(t *Type, a core.Address) *Type {
@@ -546,12 +568,18 @@ func (p *Process) typeHeap() {
 			r := p.types[i].r
 			if t == nil {
 				if len(chunks) > 0 {
-					p.types[i].t = &Type{}
-					p.types[i].t.Name = chunks[0].t.Name
+					// Sometimes, we might see an interior pointer to an object that
+					// we'll never see a 0-offset pointer to. In this case, we should
+					// optimistically type the outer object.
+					t = chunks[0].t
+					r = chunks[0].r
+					p.types[i].t = t
+					p.types[i].r = r
+					//continue // We have no type info at offset 0.
 				} else {
 					panic("no type info and no chunks")
 				}
-				continue // We have no type info at offset 0.
+				// continue // We have no type info at offset 0.
 			}
 			for _, c := range chunks {
 				if c.max() <= r*t.Size {
