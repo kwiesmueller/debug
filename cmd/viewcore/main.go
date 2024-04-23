@@ -470,27 +470,35 @@ func runHistogram(cmd *cobra.Command, args []string) {
 	if err != nil {
 		exitf("%v\n", err)
 	}
+	type exemplar struct {
+		addr core.Address
+		size int64
+	}
 	// Produce an object histogram (bytes per type).
 	type bucket struct {
-		name  string
-		size  int64
-		count int64
+		name      string
+		size      int64
+		count     int64
+		exemplars []exemplar
 	}
 	var buckets []*bucket
 	m := map[string]*bucket{}
 	c.ForEachObject(func(x gocore.Object) bool {
-		name := typeName(c, x)
+		name := typeNameDebug(c, x)
 		b := m[name]
 		if b == nil {
 			b = &bucket{name: name, size: c.Size(x)}
 			buckets = append(buckets, b)
 			m[name] = b
 		}
+		if len(b.exemplars) < 3 {
+			b.exemplars = append(b.exemplars, exemplar{addr: core.Address(x), size: c.Size(x)})
+		}
 		b.count++
 		return true
 	})
 	sort.Slice(buckets, func(i, j int) bool {
-		return buckets[i].size*buckets[i].count > buckets[j].size*buckets[j].count
+		return buckets[i].count*buckets[i].size > buckets[j].count*buckets[j].size
 	})
 
 	// report only top N if requested
@@ -499,9 +507,15 @@ func runHistogram(cmd *cobra.Command, args []string) {
 	}
 
 	t := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', tabwriter.AlignRight)
-	fmt.Fprintf(t, "%s\t%s\t%s\t %s\n", "count", "size", "bytes", "type")
+	fmt.Fprintf(t, "%s\t%s\t%s\t %s\t %s\n", "count", "size", "bytes", "type", "exemplars[addr:size]")
 	for _, e := range buckets {
-		fmt.Fprintf(t, "%d\t%d\t%d\t %s\n", e.count, e.size, e.count*e.size, e.name)
+		var exemplars strings.Builder
+		exemplars.WriteRune('[')
+		for _, exemplar := range e.exemplars {
+			exemplars.WriteString(fmt.Sprintf("%v:%v,", exemplar.addr, exemplar.size))
+		}
+		exemplars.WriteRune(']')
+		fmt.Fprintf(t, "%d\t%d\t%d\t %s\t %s\n", e.count, e.size, e.count*e.size, e.name, exemplars.String())
 	}
 	t.Flush()
 }
@@ -554,7 +568,7 @@ func runObjgraph(cmd *cobra.Command, args []string) {
 		printed := false
 		c.ForEachRootPtr(r, func(i int64, y gocore.Object, j int64) bool {
 			if !printed {
-				fmt.Fprintf(w, "r%d [label=\"%s\n%s\",shape=hexagon]\n", k, r.Name, r.Type)
+				fmt.Fprintf(w, "r%d [label=\"%s.%s\",shape=hexagon]\n", k, r.Name, r.Type)
 				printed = true
 			}
 			fmt.Fprintf(w, "r%d -> o%x [label=\"%s\"", k, c.Addr(y), typeFieldName(r.Type, i))
@@ -767,9 +781,34 @@ func typeName(c *gocore.Process, x gocore.Object) string {
 	size := c.Size(x)
 	typ, repeat := c.Type(x)
 	if typ == nil {
-		return fmt.Sprintf("unk%d", size)
+		return fmt.Sprintf("unk%d-[%d]", size, repeat)
 	}
 	name := typ.String()
+	if typ.Size == 0 {
+		return name
+	}
+	n := size / typ.Size
+	if n > 1 {
+		if repeat < n {
+			name = fmt.Sprintf("[%d+%d?]%s", repeat, n-repeat, name)
+		} else {
+			name = fmt.Sprintf("[%d]%s", repeat, name)
+		}
+	}
+	return name
+}
+
+// typeName returns a string representing the type of this object.
+func typeNameDebug(c *gocore.Process, x gocore.Object) string {
+	size := c.Size(x)
+	typ, repeat := c.TypeDebug(x)
+	if typ == nil {
+		return fmt.Sprintf("unk%d-[%d]", size, repeat)
+	}
+	name := typ.String()
+	if typ.Size == 0 {
+		return name
+	}
 	n := size / typ.Size
 	if n > 1 {
 		if repeat < n {
@@ -784,12 +823,15 @@ func typeName(c *gocore.Process, x gocore.Object) string {
 // fieldName returns the name of the field at offset off in x.
 func fieldName(c *gocore.Process, x gocore.Object, off int64) string {
 	size := c.Size(x)
-	typ, repeat := c.Type(x)
+	typ, repeat := c.TypeDebug(x)
 	if typ == nil {
 		return fmt.Sprintf("f%d", off)
 	}
-	n := size / typ.Size
-	i := off / typ.Size
+	var n, i int64
+	if typ.Size != 0 {
+		n = size / typ.Size
+		i = off / typ.Size
+	}
 	if i == 0 && repeat == 1 {
 		// Probably a singleton object, no need for array notation.
 		return typeFieldName(typ, off)

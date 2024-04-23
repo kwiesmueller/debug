@@ -4,7 +4,11 @@
 
 package gocore
 
-import "golang.org/x/debug/internal/core"
+import (
+	"fmt"
+
+	"golang.org/x/debug/internal/core"
+)
 
 // A region is a piece of the virtual address space of the inferior.
 // It has an address and a type.
@@ -160,11 +164,36 @@ func (r region) SliceCap() int64 {
 // Field returns the part of r which contains the field f.
 // r must contain a struct, and f must be one of its fields.
 func (r region) Field(f string) region {
+	if !r.HasField(f) {
+		fmt.Printf("can't find field %v.%s, found fields: %v\n", r.typ.Name, f, r.typ.Fields)
+	}
 	finfo := r.typ.field(f)
 	if finfo == nil {
 		panic("can't find field " + r.typ.Name + "." + f)
 	}
 	return region{p: r.p, a: r.a.Add(finfo.Off), typ: finfo.Type}
+}
+
+// Field returns the part of r which contains the field f.
+// r must contain a struct, and f must be one of its fields.
+func (r region) FieldSafe(f string) (region, bool) {
+	if !r.HasField(f) {
+		return region{}, false
+	}
+
+	finfo := r.typ.field(f)
+	if finfo == nil {
+		panic("can't find field " + r.typ.Name + "." + f)
+	}
+	return region{p: r.p, a: r.a.Add(finfo.Off), typ: finfo.Type}, true
+}
+
+func (r region) FieldAlt(f, f1 string) region {
+	rn, ok := r.FieldSafe(f)
+	if !ok {
+		return r.Field(f1)
+	}
+	return rn
 }
 
 func (r region) HasField(f string) bool {

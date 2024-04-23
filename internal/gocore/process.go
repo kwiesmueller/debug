@@ -106,12 +106,28 @@ func (p *Process) FindFunc(pc core.Address) *Func {
 	return p.funcTab.find(pc)
 }
 
+func (p *Process) findTypeSafe(name string) (*Type, bool) {
+	s := p.runtimeNameMap[name]
+	if len(s) == 0 {
+		return nil, false
+	}
+	return s[0], true
+}
+
 func (p *Process) findType(name string) *Type {
 	s := p.runtimeNameMap[name]
 	if len(s) == 0 {
 		panic("can't find type " + name)
 	}
 	return s[0]
+}
+
+func (p *Process) findTypeAlt(name, name1 string) *Type {
+	nt, ok := p.findTypeSafe(name)
+	if !ok {
+		return p.findType(name1)
+	}
+	return nt
 }
 
 // Core takes a loaded core file and extracts Go information from it.

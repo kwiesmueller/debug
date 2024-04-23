@@ -145,8 +145,9 @@ func (p *Process) runtimeType2Type(a core.Address, d core.Address) *Type {
 	}
 
 	// Read runtime._type.size
-	r := region{p: p, a: a, typ: p.findType("runtime._type")}
-	size := int64(r.Field("size").Uintptr())
+	ty := p.findTypeAlt("abi.Type", "runtime._type")
+	r := region{p: p, a: a, typ: ty}
+	size := int64(r.FieldAlt("Size_", "size").Uintptr())
 
 	// Find module this type is in.
 	var m *module
@@ -160,12 +161,12 @@ func (p *Process) runtimeType2Type(a core.Address, d core.Address) *Type {
 	// Read information out of the runtime._type.
 	var name string
 	if m != nil {
-		x := m.types.Add(int64(r.Field("str").Int32()))
+		x := m.types.Add(int64(r.FieldAlt("Str", "str").Int32()))
 		i, n := readNameLen(p, x)
 		b := make([]byte, n)
 		p.proc.ReadAt(b, x.Add(i+1))
 		name = string(b)
-		if r.Field("tflag").Uint8()&uint8(p.rtConstants["tflagExtraStar"]) != 0 {
+		if r.FieldAlt("TFlag", "tflag").Uint8()&uint8(p.rtConstants["tflagExtraStar"]) != 0 {
 			name = name[1:]
 		}
 	} else {
@@ -177,10 +178,10 @@ func (p *Process) runtimeType2Type(a core.Address, d core.Address) *Type {
 
 	// Read ptr/nonptr bits
 	ptrSize := p.proc.PtrSize()
-	nptrs := int64(r.Field("ptrdata").Uintptr()) / ptrSize
+	nptrs := int64(r.FieldAlt("PtrBytes", "ptrdata").Uintptr()) / ptrSize
 	var ptrs []int64
-	if r.Field("kind").Uint8()&uint8(p.rtConstants["kindGCProg"]) == 0 {
-		gcdata := r.Field("gcdata").Address()
+	if r.FieldAlt("Kind_", "kind").Uint8()&uint8(p.rtConstants["kindGCProg"]) == 0 {
+		gcdata := r.FieldAlt("GCData", "gcdata").Address()
 		for i := int64(0); i < nptrs; i++ {
 			if p.proc.ReadUint8(gcdata.Add(i/8))>>uint(i%8)&1 != 0 {
 				ptrs = append(ptrs, i*ptrSize)
@@ -353,6 +354,10 @@ func (c typeChunk) merge(d typeChunk) typeChunk {
 		panic("can't merge chunks with different types")
 	}
 	size := t.Size
+	if size == 0 {
+		// panic(fmt.Sprintf("can't merge chunk with size 0: %v -- %v with %v", c, t, d))
+		return c
+	}
 	if (c.off-d.off)%size != 0 {
 		panic("can't merge poorly aligned chunks")
 	}
@@ -397,15 +402,25 @@ func (p *Process) typeHeap() {
 		}
 		var work []workRecord
 
+		addrToNonHeap := map[core.Address]struct{}{}
+
 		// add records the fact that we know the object at address a has
 		// r copies of type t.
 		add := func(a core.Address, t *Type, r int64) {
 			if a == 0 { // nil pointer
 				return
 			}
+			if t == nil {
+				fmt.Printf("%v has nil type\n", a)
+			}
 			i, off := p.findObjectIndex(a)
 			if i < 0 { // pointer doesn't point to an object in the Go heap
+				addrToNonHeap[a] = struct{}{}
 				return
+			}
+			if p.types[i].t == nil {
+				p.types[i].t = &Type{}
+				p.types[i].t.Name = t.Name
 			}
 			if off == 0 {
 				// We have a 0-offset typing. Replace existing 0-offset typing
@@ -530,6 +545,12 @@ func (p *Process) typeHeap() {
 			t := p.types[i].t
 			r := p.types[i].r
 			if t == nil {
+				if len(chunks) > 0 {
+					p.types[i].t = &Type{}
+					p.types[i].t.Name = chunks[0].t.Name
+				} else {
+					panic("no type info and no chunks")
+				}
 				continue // We have no type info at offset 0.
 			}
 			for _, c := range chunks {
@@ -549,6 +570,10 @@ func (p *Process) typeHeap() {
 				// merged with the 0-offset typing.  TODO: make more use of this info.
 			}
 		}
+		// fmt.Println("Addrs not on heap:")
+		// for addr := range addrToNonHeap {
+		// 	fmt.Println(addr)
+		// }
 	})
 }
 
@@ -599,12 +624,14 @@ func extractTypeFromFunctionName(method string, p *Process) *Type {
 
 // ifaceIndir reports whether t is stored indirectly in an interface value.
 func ifaceIndir(t core.Address, p *Process) bool {
-	typr := region{p: p, a: t, typ: p.findType("runtime._type")}
-	if typr.Field("kind").Uint8()&uint8(p.rtConstants["kindDirectIface"]) == 0 {
+	typr := region{p: p, a: t, typ: p.findTypeAlt("abi.Type", "runtime._type")}
+	if typr.FieldAlt("Kind_", "kind").Uint8()&uint8(p.rtConstants["kindDirectIface"]) == 0 {
 		return true
 	}
 	return false
 }
+
+var seenNonPointerTypes = map[string]struct{}{}
 
 // typeObject takes an address and a type for the data at that address.
 // For each pointer it finds in the memory at that address, it calls add with the pointer
@@ -655,7 +682,11 @@ func (p *Process) typeObject(a core.Address, t *Type, r reader, add func(core.Ad
 				}
 			}
 			if directTyp.Kind != KindFunc && directTyp.Kind != KindPtr {
-				panic(fmt.Sprintf("type of direct interface, originally %s (kind %s), isn't a pointer: %s (kind %s)", typ, typ.Kind, directTyp, directTyp.Kind))
+				if _, seen := seenNonPointerTypes[typ.String()]; !seen {
+					fmt.Printf("type of direct interface, originally %s (kind %s), isn't a pointer: %s (kind %s) %v %#v\n", typ, typ.Kind, directTyp, directTyp.Kind, typ.Fields, typ)
+					seenNonPointerTypes[typ.String()] = struct{}{}
+				}
+				// break
 			}
 			break
 		}

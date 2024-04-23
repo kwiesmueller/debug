@@ -34,6 +34,10 @@ func (p *Process) markObjects() {
 			// Invalid spans can happen with intra-stack pointers.
 			return
 		}
+		// if h.size == 0 {
+		// 	// fmt.Println(x, "size == 0")
+		// 	return
+		// }
 		// Round down to object start.
 		x = h.base.Add(x.Sub(h.base) / h.size * h.size)
 		// Object start may map to a different info. Reload heap info.
@@ -169,6 +173,9 @@ func (p *Process) FindObject(a core.Address) (Object, int64) {
 		// that doesn't hold Go objects (freed, stacks, ...)
 		return 0, 0
 	}
+	// if h.size == 0 {
+	// 	return 0, 0
+	// }
 	x := h.base.Add(a.Sub(h.base) / h.size * h.size)
 	// Check if object is marked.
 	h = p.findHeapInfo(x)
@@ -242,6 +249,18 @@ func (p *Process) Type(x Object) (*Type, int64) {
 	p.typeHeap()
 
 	i, _ := p.findObjectIndex(core.Address(x))
+	return p.types[i].t, p.types[i].r
+}
+
+// Type returns the type and repeat count for the object x.
+// x contains at least repeat copies of the returned type.
+func (p *Process) TypeDebug(x Object) (*Type, int64) {
+	p.typeHeap()
+
+	i, _ := p.findObjectIndex(core.Address(x))
+	if p.types[i].t == nil {
+		// fmt.Printf("Couldn't find type for object %v at index %v\n", x, i)
+	}
 	return p.types[i].t, p.types[i].r
 }
 
@@ -341,6 +360,10 @@ type heapInfo struct {
 }
 
 func (h *heapInfo) IsPtr(a core.Address, ptrSize int64) bool {
+	// if h == nil {
+	// 	fmt.Println("heapInfo == nil: %v %v", a, ptrSize)
+	// 	return true
+	// }
 	if ptrSize == 8 {
 		i := uint(a%heapInfoSize) / 8
 		return h.ptr[0]>>i&1 != 0
@@ -370,14 +393,17 @@ type pageTableEntry [pageTableSize]heapInfo
 // findHeapInfo finds the heapInfo structure for a.
 // Returns nil if a is not a heap address.
 func (p *Process) findHeapInfo(a core.Address) *heapInfo {
+	// return p.allocHeapInfo(a)
 	k := a / heapInfoSize / pageTableSize
 	i := a / heapInfoSize % pageTableSize
 	t := p.pageTable[k]
 	if t == nil {
+		// fmt.Printf("addr %v not in pageTable\n", a)
 		return nil
 	}
 	h := &t[i]
 	if h.base == 0 {
+		// fmt.Printf("addr %v base == 0\n", a)
 		return nil
 	}
 	return h
